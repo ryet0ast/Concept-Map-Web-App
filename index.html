@@ -203,6 +203,7 @@
   }
 
   .tb-btn:hover { background: rgba(255,255,255,0.16); color: #fff; }
+  .tb-btn:disabled { opacity: 0.35; cursor: default; pointer-events: none; }
 
   .tb-btn.active {
     background: rgba(109,40,217,0.7);
@@ -450,6 +451,7 @@
     <span class="toolbar-hint">Double-click to add node</span>
     <button class="tb-btn" id="connect-btn" onclick="toggleConnectMode()">⟷ Connect Nodes</button>
     <button class="tb-btn" onclick="clearSelection()">Clear Selection</button>
+    <button class="tb-btn" id="undo-btn" onclick="undo()" disabled>↩ Undo</button>
     <div class="tb-divider"></div>
     <button class="tb-btn" onclick="newMap()">New Map</button>
     <div class="tb-dropdown-wrap">
@@ -457,9 +459,13 @@
       <div id="export-menu">
         <div class="ctx-item" onclick="exportPNG(); closeExportMenu()">🖼 Download PNG</div>
         <div class="ctx-item" onclick="window.print(); closeExportMenu()">📄 Print / PDF</div>
+        <div class="ctx-separator"></div>
+        <div class="ctx-item" onclick="saveMap(); closeExportMenu()">💾 Save Map (.json)</div>
+        <div class="ctx-item" onclick="loadMapPicker(); closeExportMenu()">📂 Load Map…</div>
       </div>
     </div>
   </div>
+  <input type="file" id="map-file-input" accept=".json" style="display:none" onchange="loadMapFromFile(event)">
 
   <div id="canvas"
     ondblclick="canvasDblClick(event)"
@@ -480,7 +486,7 @@
 <div id="ctx-menu">
   <div class="ctx-item" onclick="ctxAction('add-child')">➕ Add Child</div>
   <div class="ctx-item" onclick="ctxAction('rename')">✏️ Rename</div>
-  <div class="ctx-item" id="ctx-make-bridge" onclick="ctxAction('make-bridge')">🔮 Make Bridge Node</div>
+  <div id="ctx-dynamic"></div>
   <div class="ctx-separator"></div>
   <div class="ctx-item danger" id="ctx-delete" onclick="ctxAction('delete')">🗑️ Delete Node</div>
 </div>
@@ -507,11 +513,45 @@ const state = {
   concepts: [],
   selected: null,
   connectMode: false, connectFrom: null,
-  dragging: null, dragOffset: { x: 0, y: 0 },
-  ctxTarget: null, nextId: 0
+  dragging: null, dragOffset: { x: 0, y: 0 }, dragStartPos: null,
+  ctxTarget: null, nextId: 0,
+  history: [], historyLimit: 50
 };
 
 function genId() { return 'n' + state.nextId++; }
+
+// ── History / Undo ─────────────────────────────────────
+function saveHistory() {
+  state.history.push({
+    nodes: JSON.parse(JSON.stringify(state.nodes)),
+    edges: JSON.parse(JSON.stringify(state.edges))
+  });
+  if (state.history.length > state.historyLimit) state.history.shift();
+  updateUndoBtn();
+}
+
+function popHistory() {
+  state.history.pop();
+  updateUndoBtn();
+}
+
+function undo() {
+  if (state.history.length === 0) return;
+  const snap = state.history.pop();
+  state.nodes = snap.nodes;
+  state.edges = snap.edges;
+  state.selected = null;
+  state.connectMode = false;
+  state.connectFrom = null;
+  updateConnectBtn();
+  updateUndoBtn();
+  renderAll();
+}
+
+function updateUndoBtn() {
+  const btn = document.getElementById('undo-btn');
+  if (btn) btn.disabled = state.history.length === 0;
+}
 
 // ── Setup ──────────────────────────────────────────────
 let conceptCount = 2;
@@ -618,12 +658,13 @@ function newMap() {
   if (!confirm('Start a new map? All current work will be lost.')) return;
   state.nodes = []; state.edges = [];
   state.selected = null; state.connectMode = false; state.connectFrom = null;
-  state.dragging = null; state.nextId = 0;
+  state.dragging = null; state.nextId = 0; state.history = [];
   document.querySelectorAll('.node').forEach(el => el.remove());
   document.getElementById('svg-layer').innerHTML = '';
   document.getElementById('app').style.display = 'none';
   document.getElementById('setup-screen').style.display = 'flex';
   updateConnectBtn();
+  updateUndoBtn();
   renderSetupInputs();
 }
 
@@ -701,7 +742,7 @@ function nodeClick(e, id) {
         (ed.from === state.connectFrom && ed.to === id) ||
         (ed.from === id && ed.to === state.connectFrom)
       );
-      if (!exists) state.edges.push({ id: genId(), from: state.connectFrom, to: id, type: 'connection' });
+      if (!exists) { saveHistory(); state.edges.push({ id: genId(), from: state.connectFrom, to: id, type: 'connection' }); }
       state.connectFrom = null; state.connectMode = false;
       updateConnectBtn(); renderAll();
     }
@@ -720,10 +761,11 @@ function canvasDblClick(e) {
   if (t !== canvas && t !== bz && t !== svg) return;
   if (state.connectMode) return;
   const id = genId();
-  state.nodes.push({ id, text: 'Bridge Idea', x: e.clientX, y: e.clientY, conceptIdx: 'bridge', parentId: null, isRoot: false });
+  saveHistory();
+  state.nodes.push({ id, text: '', x: e.clientX, y: e.clientY, conceptIdx: 'bridge', parentId: null, isRoot: false });
   state.selected = id;
   renderAll();
-  showInlineEditorAt(id, e.clientX, e.clientY, true);
+  showNewNodeEditor(id, e.clientX, e.clientY);
 }
 
 function canvasClick(e) {
@@ -745,7 +787,9 @@ function nodeMouseDown(e, id) {
   state.dragging = id;
   const node = state.nodes.find(n => n.id === id);
   state.dragOffset = { x: e.clientX - node.x, y: e.clientY - node.y };
+  state.dragStartPos = { x: node.x, y: node.y };
   state.selected = id;
+  saveHistory();
 }
 
 function canvasMouseMove(e) {
@@ -757,7 +801,17 @@ function canvasMouseMove(e) {
   renderAll();
 }
 
-function canvasMouseUp() { state.dragging = null; }
+function canvasMouseUp() {
+  if (state.dragging) {
+    const node = state.nodes.find(n => n.id === state.dragging);
+    if (node && state.dragStartPos &&
+        node.x === state.dragStartPos.x && node.y === state.dragStartPos.y) {
+      popHistory(); // click with no movement — discard the snapshot
+    }
+  }
+  state.dragging = null;
+  state.dragStartPos = null;
+}
 
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
@@ -766,6 +820,9 @@ document.addEventListener('keydown', (e) => {
   }
   if ((e.key === 'Delete' || e.key === 'Backspace') && document.activeElement.tagName !== 'INPUT') {
     if (state.selected) deleteNode(state.selected);
+  }
+  if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey && document.activeElement.tagName !== 'INPUT') {
+    e.preventDefault(); undo();
   }
 });
 
@@ -813,53 +870,84 @@ function childPosition(parent) {
 function showInlineEditor(parentId, isRename) {
   const parent = state.nodes.find(n => n.id === parentId);
   if (!parent) return;
-  if (isRename) { showInlineEditorAt(parentId, parent.x, parent.y, true); return; }
+  if (isRename) { showRenameEditor(parentId); return; }
   const pos = childPosition(parent);
   const newId = genId();
+  saveHistory(); // save BEFORE adding node so cancel can restore cleanly
   state.nodes.push({ id: newId, text: '', x: pos.x, y: pos.y, conceptIdx: parent.conceptIdx, parentId, isRoot: false });
   state.edges.push({ id: genId(), from: parentId, to: newId, type: 'hierarchy' });
   state.selected = newId;
   renderAll();
-  showInlineEditorAt(newId, pos.x, pos.y, false);
+  showNewNodeEditor(newId, pos.x, pos.y);
 }
 
-function showInlineEditorAt(nodeId, x, y, isRename) {
-  const node = state.nodes.find(n => n.id === nodeId);
+// For new nodes (child or floating bridge) — caller must saveHistory() before adding node
+function showNewNodeEditor(nodeId, x, y) {
   const canvas = document.getElementById('canvas');
   const wrap = document.createElement('div');
   wrap.className = 'inline-editor';
   wrap.style.left = x + 'px'; wrap.style.top = y + 'px';
   const inp = document.createElement('input');
   inp.type = 'text'; inp.placeholder = 'Type & press Enter'; inp.maxLength = 50;
-  if (isRename && node) inp.value = node.text;
   wrap.appendChild(inp); canvas.appendChild(wrap);
-  inp.focus(); inp.select();
+  inp.focus();
 
-  function commit() {
-    const val = inp.value.trim();
-    const n = state.nodes.find(nd => nd.id === nodeId);
-    if (!val && !isRename) {
-      state.nodes = state.nodes.filter(nd => nd.id !== nodeId);
-      state.edges = state.edges.filter(ed => ed.from !== nodeId && ed.to !== nodeId);
-      state.selected = null;
-    } else if (val && n) { n.text = val; }
-    wrap.remove(); renderAll();
-  }
-  function cancel() {
-    if (!isRename) {
+  let done = false;
+  function finish(val) {
+    if (done) return; done = true;
+    wrap.remove();
+    if (val) {
+      const n = state.nodes.find(nd => nd.id === nodeId);
+      if (n) n.text = val;
+    } else {
+      popHistory(); // discard snapshot — node never committed
       state.nodes = state.nodes.filter(nd => nd.id !== nodeId);
       state.edges = state.edges.filter(ed => ed.from !== nodeId && ed.to !== nodeId);
       state.selected = null;
     }
-    wrap.remove(); renderAll();
+    renderAll();
   }
 
   inp.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter')  { e.preventDefault(); commit(); }
-    if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+    if (e.key === 'Enter')  { e.preventDefault(); finish(inp.value.trim()); }
+    if (e.key === 'Escape') { e.preventDefault(); finish(''); }
     e.stopPropagation();
   });
-  inp.addEventListener('blur', commit);
+  inp.addEventListener('blur', () => finish(inp.value.trim()));
+}
+
+// For renaming existing nodes — saves history only when text actually changes
+function showRenameEditor(nodeId) {
+  const node = state.nodes.find(n => n.id === nodeId);
+  if (!node) return;
+  const oldText = node.text;
+  const canvas = document.getElementById('canvas');
+  const wrap = document.createElement('div');
+  wrap.className = 'inline-editor';
+  wrap.style.left = node.x + 'px'; wrap.style.top = node.y + 'px';
+  const inp = document.createElement('input');
+  inp.type = 'text'; inp.placeholder = 'Type & press Enter'; inp.maxLength = 50;
+  inp.value = oldText;
+  wrap.appendChild(inp); canvas.appendChild(wrap);
+  inp.focus(); inp.select();
+
+  let done = false;
+  function finish(val) {
+    if (done) return; done = true;
+    wrap.remove();
+    if (val && val !== oldText) {
+      saveHistory(); // state still has oldText at this point ✓
+      node.text = val;
+    }
+    renderAll();
+  }
+
+  inp.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter')  { e.preventDefault(); finish(inp.value.trim()); }
+    if (e.key === 'Escape') { e.preventDefault(); finish(''); }
+    e.stopPropagation();
+  });
+  inp.addEventListener('blur', () => finish(inp.value.trim()));
 }
 
 // ── Context Menu ───────────────────────────────────────
@@ -867,11 +955,35 @@ function showCtxMenu(e, id) {
   state.ctxTarget = id; state.selected = id; renderAll();
   const menu = document.getElementById('ctx-menu');
   const node = state.nodes.find(n => n.id === id);
-  document.getElementById('ctx-delete').style.display     = (node && node.isRoot) ? 'none' : 'flex';
-  document.getElementById('ctx-make-bridge').style.display = (node && node.conceptIdx === 'bridge') ? 'none' : 'flex';
+  document.getElementById('ctx-delete').style.display = (node && node.isRoot) ? 'none' : 'flex';
+
+  // Build dynamic middle section
+  const dynSection = document.getElementById('ctx-dynamic');
+  dynSection.innerHTML = '';
+  if (node) {
+    if (node.conceptIdx === 'bridge') {
+      // Offer re-assignment to each concept
+      state.concepts.forEach((c, i) => {
+        const p = PALETTE[i];
+        const item = document.createElement('div');
+        item.className = 'ctx-item';
+        item.innerHTML = `<span style="display:inline-block;width:9px;height:9px;border-radius:50%;background:linear-gradient(135deg,${p.bg[0]},${p.bg[1]});flex-shrink:0"></span>Assign to: ${c.name}`;
+        item.addEventListener('click', () => { menu.style.display = 'none'; assignNodeToConcept(id, i); });
+        dynSection.appendChild(item);
+      });
+    } else {
+      // Offer bridge conversion
+      const item = document.createElement('div');
+      item.className = 'ctx-item';
+      item.textContent = '🔮 Make Bridge Node';
+      item.addEventListener('click', () => { menu.style.display = 'none'; ctxAction('make-bridge'); });
+      dynSection.appendChild(item);
+    }
+  }
+
   menu.style.display = 'block';
-  menu.style.left = Math.min(e.clientX, window.innerWidth  - 190) + 'px';
-  menu.style.top  = Math.min(e.clientY, window.innerHeight - 190) + 'px';
+  menu.style.left = Math.min(e.clientX, window.innerWidth  - 210) + 'px';
+  menu.style.top  = Math.min(e.clientY, window.innerHeight - 280) + 'px';
 }
 
 document.addEventListener('click', () => {
@@ -886,14 +998,23 @@ function ctxAction(action) {
   if (!node) return;
   if (action === 'add-child')   showInlineEditor(id, false);
   else if (action === 'rename') showInlineEditor(id, true);
-  else if (action === 'make-bridge') { node.conceptIdx = 'bridge'; renderAll(); }
+  else if (action === 'make-bridge') { saveHistory(); node.conceptIdx = 'bridge'; renderAll(); }
   else if (action === 'delete') deleteNode(id);
   document.getElementById('ctx-menu').style.display = 'none';
+}
+
+function assignNodeToConcept(id, conceptIdx) {
+  const node = state.nodes.find(n => n.id === id);
+  if (!node) return;
+  saveHistory();
+  node.conceptIdx = conceptIdx;
+  renderAll();
 }
 
 function deleteNode(id) {
   const node = state.nodes.find(n => n.id === id);
   if (!node || node.isRoot) return;
+  saveHistory();
   const toDelete = new Set();
   function collect(nid) {
     toDelete.add(nid);
@@ -915,6 +1036,65 @@ function toggleExportMenu(e) {
 
 function closeExportMenu() {
   document.getElementById('export-menu').style.display = 'none';
+}
+
+function saveMap() {
+  const data = {
+    version: 1,
+    concepts: state.concepts,
+    nodes:    state.nodes,
+    edges:    state.edges,
+    nextId:   state.nextId
+  };
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  const name = state.concepts.map(c => c.name).join('-').replace(/[^a-z0-9-]/gi, '_') || 'mindmap';
+  a.download = `${name}.json`;
+  a.href = URL.createObjectURL(blob);
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+function loadMapPicker() {
+  const input = document.getElementById('map-file-input');
+  input.value = ''; // reset so the same file can be re-loaded
+  input.click();
+}
+
+function loadMapFromFile(event) {
+  const file = event.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    let data;
+    try { data = JSON.parse(e.target.result); } catch {
+      alert('Could not read the file — make sure it is a valid mindmap .json file.');
+      return;
+    }
+    if (!data.concepts || !data.nodes || !data.edges) {
+      alert('This file does not appear to be a valid mindmap save.');
+      return;
+    }
+    state.concepts  = data.concepts;
+    state.nodes     = data.nodes;
+    state.edges     = data.edges;
+    state.nextId    = data.nextId ?? (data.nodes.length + data.edges.length + 1);
+    state.selected  = null;
+    state.connectMode  = false;
+    state.connectFrom  = null;
+    state.dragging     = null;
+    state.dragStartPos = null;
+    state.history      = [];
+    conceptCount = state.concepts.length;
+    buildLegend();
+    document.getElementById('bridge-zone').style.display = conceptCount === 1 ? 'none' : '';
+    document.getElementById('setup-screen').style.display = 'none';
+    document.getElementById('app').style.display = 'block';
+    updateConnectBtn();
+    updateUndoBtn();
+    renderAll();
+  };
+  reader.readAsText(file);
 }
 
 function exportPNG() {
